@@ -9,4 +9,6 @@ services:
       - ./.ccache:/root/.cache/ccache
       - ./.buildroot-ccache:/root/.buildroot-ccache
       - ./.buildroot_dl:/buildroot_dl
+      # Local SeedWarden app checkout (private repo), used with --app-dir=/app
+      - ${SW_APP_DIR:-../SeedWarden}:/app:ro
     command: "${SS_ARGS:---no-op}"

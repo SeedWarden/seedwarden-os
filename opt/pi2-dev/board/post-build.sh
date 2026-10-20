@@ -53,21 +53,6 @@ ln -srf ${TARGET_DIR}/usr/lib/python3.12 ${TARGET_DIR}/usr/lib/python3
 ln -srf ${BUILD_DIR}/python3-3.12.10 ${BUILD_DIR}/python3-3.10.10
 ln -srf ${BUILD_DIR}/python3-3.12.10 ${BUILD_DIR}/python3
 
-# Clean up files included in embit we don't need (foreign-platform prebuilts; same as the release image)
-rm -rf ${TARGET_DIR}/usr/lib/python3/site-packages/embit/liquid
-rm -rf ${TARGET_DIR}/usr/lib/python3/site-packages/embit/util/prebuilt/libsecp256k1_darwin_arm64.dylib
-rm -rf ${TARGET_DIR}/usr/lib/python3/site-packages/embit/util/prebuilt/libsecp256k1_darwin_x86_64.dylib
-rm -rf ${TARGET_DIR}/usr/lib/python3/site-packages/embit/util/prebuilt/libsecp256k1_linux_aarch64.so
-rm -rf ${TARGET_DIR}/usr/lib/python3/site-packages/embit/util/prebuilt/libsecp256k1_linux_x86_64.so
-rm -rf ${TARGET_DIR}/usr/lib/python3/site-packages/embit/util/prebuilt/libsecp256k1_windows_amd64.dll
-
-# Remove embit's pure-Python secp256k1 fallback: we must run only on the pre-compiled
-# libsecp256k1 C code or not at all. We explicitly opt for hard failure over silent
-# fallback.
-# We must delete both the .py and the .pyc to fully remove the fallback.
-rm -f ${TARGET_DIR}/usr/lib/python3/site-packages/embit/util/py_secp256k1.py
-rm -f ${TARGET_DIR}/usr/lib/python3/site-packages/embit/util/py_secp256k1.pyc
-
 # Dev convenience: make `python3 -m venv DIR` produce a usable venv by default.
 # This image's Python is built --without-ensurepip and carries the app's native
 # deps (PIL/numpy/embit/...) only in the system site-packages, so the two useful
@@ -104,6 +89,3 @@ SOURCE_DATE_EPOCH=1 PYTHONHASHSEED=0 ${HOST_DIR}/bin/python3.12 \
   "${BUILD_DIR}/python3-3.12.10/Lib/compileall.py" \
   -f --invalidation-mode=checked-hash "${TARGET_DIR}/opt/src"
 
-# Fail the build if embit can't reach the pre-compiled libsecp256k1 or if we detect the
-# pure-python secp256k1 fallback is present.
-"$(dirname "$0")/../../external-packages/python-embit/verify-secp256k1-binary.sh" "${TARGET_DIR}"

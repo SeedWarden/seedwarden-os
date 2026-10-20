@@ -6,7 +6,7 @@ export FORCE_UNSAFE_CONFIGURE=1 # Allows buildroot/tar to run as root user in do
 # global variables
 cur_dir_name=${PWD##*/}
 cur_dir=$(pwd)
-seedsigner_app_repo="https://github.com/SeedSigner/seedsigner.git"
+seedsigner_app_repo="https://github.com/SeedWarden/seedwarden.git"
 seedsigner_app_repo_branch="dev"
 
 help()
@@ -28,6 +28,7 @@ help()
       --app-repo       Build image with not official seedsigner github repo
       --app-branch     Build image with repo branch other than default
       --app-commit-id  Build image with specific repo commit id
+      --app-dir        Use a local app checkout (e.g. /app, mounted by docker-compose) instead of cloning
       --no-op          All other option ignored and script just hangs to keep container alive"
   exit 2
 }
@@ -38,148 +39,53 @@ tail_endless() {
   exit 0
 }
 
-compile_translations_and_fonts() {
+# The app lands in ${rootfs_overlay}/opt/src/seedwarden (package only, no tests/tools).
+# On the device: PYTHONPATH=/opt/src python3 -m seedwarden
 
-  # create virtual env to compile translation files and slim down font files
-  virtualenv .translation-venv
-  source .translation-venv/bin/activate
-  cd ${rootfs_overlay}/opt
-
-  ss_translations_repo="./src/seedsigner/resources/seedsigner-translations"
-
-  # install pinned, hash-locked dependencies: babel + setuptools come from the
-  # app repo's own l10n requirements; fonttools (pyftsubset) is a build-only
-  # addition pinned in this repo (see requirements-l10n-build.txt).
-  # --require-hashes fails the build if either file regresses to unhashed pins.
-  pip install --require-hashes -r l10n/requirements-l10n.txt || exit
-  pip install --require-hashes -r "${cur_dir}/requirements-l10n-build.txt" || exit
-
-  # remove any existing binary mo files if they exist
-  rm -rf ${ss_translations_repo}/l10n/**/**/*.mo
-
-  # generate messages.mo files for each translation
-  python3 setup.py compile_catalog || exit
-
-  # extract characters from all messages.mo translations into all_chars shell variable
-  all_chars=""
-  for f in ${ss_translations_repo}/l10n/*/LC_MESSAGES/messages.mo; do
-    # extract just the locale name from the path (e.g. "ca" from ".../l10n/ca/LC_MESSAGES/messages.mo")
-    locale=$(basename "$(dirname "$(dirname "$f")")")
-    output_chars=$(cd ${ss_translations_repo}/tools && python3 extract_characters_from_babel_mo.py "$locale") || echo "Warning: failed to extract chars for locale: $locale" >&2
-    all_chars="${all_chars}${output_chars}"
-  done
-
-  # add newline chars
-  all_chars="${all_chars}\n\r"
-
-  # rename source NotoSans*ttf files to include "Original" in the name
-  mv ${ss_translations_repo}/fonts/NotoSansAR-Regular.ttf ${ss_translations_repo}/fonts/NotoSansAR-Regular-Original.ttf
-  mv ${ss_translations_repo}/fonts/NotoSansJP-Regular.ttf ${ss_translations_repo}/fonts/NotoSansJP-Regular-Original.ttf
-  mv ${ss_translations_repo}/fonts/NotoSansKR-Regular.ttf ${ss_translations_repo}/fonts/NotoSansKR-Regular-Original.ttf
-  mv ${ss_translations_repo}/fonts/NotoSansSC-Regular.ttf ${ss_translations_repo}/fonts/NotoSansSC-Regular-Original.ttf
-  mv ${ss_translations_repo}/fonts/NotoSansTH-Regular.ttf ${ss_translations_repo}/fonts/NotoSansTH-Regular-Original.ttf
-
-  # slim down font files using characters in all_chars
-  pyftsubset ${ss_translations_repo}/fonts/NotoSansAR-Regular-Original.ttf --text="${all_chars}" --output-file=${ss_translations_repo}/fonts/NotoSansAR-Regular.ttf || exit
-  pyftsubset ${ss_translations_repo}/fonts/NotoSansJP-Regular-Original.ttf --text="${all_chars}" --output-file=${ss_translations_repo}/fonts/NotoSansJP-Regular.ttf || exit
-  pyftsubset ${ss_translations_repo}/fonts/NotoSansKR-Regular-Original.ttf --text="${all_chars}" --output-file=${ss_translations_repo}/fonts/NotoSansKR-Regular.ttf || exit
-  pyftsubset ${ss_translations_repo}/fonts/NotoSansSC-Regular-Original.ttf --text="${all_chars}" --output-file=${ss_translations_repo}/fonts/NotoSansSC-Regular.ttf || exit
-  pyftsubset ${ss_translations_repo}/fonts/NotoSansTH-Regular-Original.ttf --text="${all_chars}" --output-file=${ss_translations_repo}/fonts/NotoSansTH-Regular.ttf || exit
-
-  # remove original font files
-  rm -f ${ss_translations_repo}/fonts/NotoSans*Regular-Original*ttf
-
-  cd -
-  deactivate
-
-}
-
-write_version_json() {
-  # Writes ${rootfs_overlay}/opt/src/seedsigner/version.json, which SeedSigner OS reads
-  # at runtime. A missing or incomplete file makes the app raise at the splash screen,
-  # so failures here are fatal.
-  # Must run while .git/ and tools/ are still present (delete_unnecessary_files drops them).
-  app_dir="${rootfs_overlay}/opt"
-
-  if [ -f "${app_dir}/src/seedsigner/version.json" ]; then
-    # Already written: either by an earlier build_image call (--all) or by the caller.
-    echo "version.json already present, leaving as-is"
-    cat "${app_dir}/src/seedsigner/version.json"
-    return
-  fi
-
-  if [ ! -f "${app_dir}/tools/write_versionfile.py" ]; then
-    echo "ERROR: ${app_dir}/tools/write_versionfile.py not found; cannot write version.json" >&2
+install_app_from_dir() {
+  # $1 = app checkout (repo root containing src/seedwarden)
+  local src="${1}/src/seedwarden"
+  if [ ! -d "${src}" ]; then
+    echo "ERROR: ${src} not found (expected the SeedWarden repo root)" >&2
     exit 1
   fi
-
-  # In CI the overlay is a bind-mounted host checkout owned by a different uid than the
-  # root user in this container. git refuses such repos ("dubious ownership") and
-  # version.py silently discards the error, yielding a version.json that bricks boot.
-  git config --global --add safe.directory "$(cd "${app_dir}" && pwd)"
-
-  # PYTHONPATH=src is enough; write_versionfile.py's imports are stdlib-only.
-  export SEEDSIGNER_OS_BUILDER=1
-  # -B (PYTHONDONTWRITEBYTECODE) is required for reproducible builds. Without it CPython
-  # caches that import chain as timestamp-invalidated __pycache__/*.pyc 
-  (cd "${app_dir}" && PYTHONPATH=src python3 -B tools/write_versionfile.py) || exit
+  rm -fr "${rootfs_overlay}/opt/"
+  mkdir -p "${rootfs_overlay}/opt/src"
+  cp -r "${src}" "${rootfs_overlay}/opt/src/seedwarden"
+  write_version_json "${1}"
 }
 
 download_app_repo() {
-  # remove previous opt seedsigner app repo code if it already exists
-  rm -fr ${rootfs_overlay}/opt/
-  
-  # Download SeedSigner from GitHub and put into rootfs
-  
-  # check for custom app branch or custom commit. Custom commit takes priority over branch name
+  local tmp_clone
+  tmp_clone="$(mktemp -d)"
   if ! [ -z ${seedsigner_app_repo_commit_id} ]; then
     echo "cloning repo ${seedsigner_app_repo} with commit id ${seedsigner_app_repo_commit_id}"
-    git clone --recurse-submodules "${seedsigner_app_repo}" "${rootfs_overlay}/opt/" || exit
-    cd ${rootfs_overlay}/opt/
-    git reset --hard "${seedsigner_app_repo_commit_id}" || exit
-    git submodule update || exit
-    cd -
+    git clone "${seedsigner_app_repo}" "${tmp_clone}" || exit
+    git -C "${tmp_clone}" reset --hard "${seedsigner_app_repo_commit_id}" || exit
   else
     echo "cloning repo ${seedsigner_app_repo} with branch ${seedsigner_app_repo_branch}"
-    git clone --recurse-submodules --depth 1 -b "${seedsigner_app_repo_branch}" "${seedsigner_app_repo}" "${rootfs_overlay}/opt/" || exit
+    git clone --depth 1 -b "${seedsigner_app_repo_branch}" "${seedsigner_app_repo}" "${tmp_clone}" || exit
   fi
+  install_app_from_dir "${tmp_clone}"
+  rm -rf "${tmp_clone}"
+}
 
-  compile_translations_and_fonts
+write_version_json() {
+  # Minimal build info for the app: {"commit": ..., "describe": ...}
+  local app_repo="${1}" commit="unknown" describe="unknown"
+  if [ -d "${app_repo}/.git" ] || [ -f "${app_repo}/.git" ]; then
+    git config --global --add safe.directory "$(cd "${app_repo}" && pwd)"
+    commit="$(git -C "${app_repo}" rev-parse HEAD 2>/dev/null || echo unknown)"
+    describe="$(git -C "${app_repo}" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+  fi
+  printf '{"commit": "%s", "describe": "%s"}\n' "${commit}" "${describe}" \
+    > "${rootfs_overlay}/opt/src/seedwarden/version.json"
+  cat "${rootfs_overlay}/opt/src/seedwarden/version.json"
 }
 
 delete_unnecessary_files() {
-  # Delete unnecessary files to save space. Runs independently of download_app_repo so
-  # that --skip-repo builds (CI, which populates rootfs-overlay/opt itself) are trimmed
-  # too. Must run after write_version_json, which needs .git/ and tools/.
-  # folders
-  rm -rf ${rootfs_overlay}/opt/.github
-  rm -rf ${rootfs_overlay}/opt/docker
-  rm -rf ${rootfs_overlay}/opt/docs
-  rm -rf ${rootfs_overlay}/opt/enclosures
-  rm -rf ${rootfs_overlay}/opt/l10n
-  rm -rf ${rootfs_overlay}/opt/seedsigner-screenshots
-  rm -rf ${rootfs_overlay}/opt/src/seedsigner.egg-info
-  rm -rf ${rootfs_overlay}/opt/src/seedsigner/resources/seedsigner-translations/.git*
-  rm -rf ${rootfs_overlay}/opt/src/seedsigner/resources/seedsigner-translations/.tx
-  rm -rf ${rootfs_overlay}/opt/src/seedsigner/resources/seedsigner-translations/tools
-  rm -rf ${rootfs_overlay}/opt/tests
-  rm -rf ${rootfs_overlay}/opt/tools
-  # files
-  rm -rf ${rootfs_overlay}/opt/.git*
-  rm -rf ${rootfs_overlay}/opt/docker-compose.yml
-  rm -rf ${rootfs_overlay}/opt/LICENSE.md
-  rm -rf ${rootfs_overlay}/opt/MANIFEST.in
-  rm -rf ${rootfs_overlay}/opt/pyproject.toml
-  rm -rf ${rootfs_overlay}/opt/README.md
-  rm -rf ${rootfs_overlay}/opt/requirements-raspi.txt
-  rm -rf ${rootfs_overlay}/opt/requirements.txt
-  rm -rf ${rootfs_overlay}/opt/SECURITY.md
-  rm -rf ${rootfs_overlay}/opt/seedsigner_pubkey.gpg
-  rm -rf ${rootfs_overlay}/opt/setup.*
-
-  rm -rf ${rootfs_overlay}/opt/src/seedsigner/resources/seedsigner-translations/LICENSE
-  rm -rf ${rootfs_overlay}/opt/src/seedsigner/resources/seedsigner-translations/README.md
-  rm -rf ${rootfs_overlay}/opt/src/seedsigner/resources/seedsigner-translations/l10n/**/**/*.po
+  find "${rootfs_overlay}/opt" -name '__pycache__' -type d -prune -exec rm -rf {} +
+  find "${rootfs_overlay}/opt" -name '*.pyc' -delete
 }
 
 build_image() {
@@ -227,14 +133,14 @@ build_image() {
   # if successful, mv seedsigner_os.img image to /images
   # rename to image to include branch name and config name, then compress
   
-  seedsigner_os_image_output="${image_dir}/seedsigner_os.${seedsigner_app_repo_branch}.${config_name}.img"
+  seedsigner_os_image_output="${image_dir}/seedwarden_os.${seedsigner_app_repo_branch}.${config_name}.img"
   if ! [ -z ${seedsigner_app_repo_commit_id} ]; then
     # use commit id instead of branch name if it is set
-    seedsigner_os_image_output="${image_dir}/seedsigner_os.${seedsigner_app_repo_commit_id}.${config_name}.img"
+    seedsigner_os_image_output="${image_dir}/seedwarden_os.${seedsigner_app_repo_commit_id}.${config_name}.img"
   fi
   
-  if [ -f "${build_dir}/images/seedsigner_os.img" ] && [ -d "${image_dir}" ]; then
-    mv -f "${build_dir}/images/seedsigner_os.img" "${seedsigner_os_image_output}"
+  if [ -f "${build_dir}/images/seedwarden_os.img" ] && [ -d "${image_dir}" ]; then
+    mv -f "${build_dir}/images/seedwarden_os.img" "${seedsigner_os_image_output}"
     sha256sum "${seedsigner_os_image_output}"
   fi
   
@@ -290,6 +196,9 @@ while (( "$#" )); do
     ;;
   --app-branch=*)
     APP_BRANCH=$(echo "${1}" | cut -d "=" -f2-); shift
+    ;;
+  --app-dir=*)
+    APP_DIR=$(echo "${1}" | cut -d "=" -f2-); shift
     ;;
   --app-commit-id=*)
     APP_COMMITID=$(echo "${1}" | cut -d "=" -f2-); shift
